@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -40,14 +41,22 @@ def content_filter(response: str) -> dict:
     redacted = response
 
     # PII patterns to check
+    # Thứ tự quan trọng: cụm dài (password/API key/host) trước, số ngắn sau
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "password": r"\b(?:admin\s+)?(?:password|passwd|pwd|mật\s*khẩu|mat\s*khau)\b\s*(?:is|là|la|:|=)\s*[\"'`]?[^\s\"'`,;]+",
+        "api_key": r"\bsk-[a-zA-Z0-9_-]{6,}",
+        "internal_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?\b",
+        "email": r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}\b",
+        "vn_phone": r"(?<!\d)(?:\+84|84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
     }
+
+    # Secret demo (admin123, sk-vinbank-…, db host) — bắt cả khi đứng một mình
+    for secret in DEMO_SECRETS:
+        pattern = re.escape(secret)
+        if re.search(pattern, redacted, re.IGNORECASE):
+            issues.append(f"protected_secret: {secret[:3]}***")
+            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
 
     for name, pattern in PII_PATTERNS.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
@@ -140,6 +149,12 @@ async def llm_safety_check(response_text: str) -> dict:
 #   - Return the (possibly modified) llm_response, or None to keep original
 # ============================================================
 
+SAFE_FALLBACK_MESSAGE = (
+    "I'm sorry, I can't share that information. "
+    "How else can I help with your VinBank account?"
+)
+
+
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
@@ -172,16 +187,24 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            response_text = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=response_text)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judged = await llm_safety_check(response_text)
+            if not judged["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=SAFE_FALLBACK_MESSAGE)],
+                )
+
+        return llm_response
 
 
 # ============================================================
