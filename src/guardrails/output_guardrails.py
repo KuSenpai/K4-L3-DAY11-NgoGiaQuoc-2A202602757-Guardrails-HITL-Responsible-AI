@@ -4,16 +4,24 @@ Checkpoint 2 — Output Guardrails
   - OutputGuardrailPlugin (ADK)           ← bắt buộc
   - LLM-as-Judge                          ← optional (không chấm)
 """
+import base64
+import binascii
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
-from core.config import DEMO_SECRETS
+from core.config import DEMO_SECRETS, load_protected_payload
 from core.utils import chat_with_agent
+
+SAFE_FALLBACK_MESSAGE = (
+    "I'm sorry, I can't share that information. "
+    "How else can I help with your VinBank account?"
+)
 
 
 # ============================================================
@@ -51,8 +59,9 @@ def content_filter(response: str) -> dict:
         "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
     }
 
-    # Secret demo (admin123, sk-vinbank-…, db host) — bắt cả khi đứng một mình
-    for secret in DEMO_SECRETS:
+    # Secret demo — giá trị đầy đủ trước (vá #4b: trước đây còn sót ":5432"),
+    # rồi tới các chuỗi con
+    for secret in _SECRET_LITERALS:
         pattern = re.escape(secret)
         if re.search(pattern, redacted, re.IGNORECASE):
             issues.append(f"protected_secret: {secret[:3]}***")
@@ -64,11 +73,94 @@ def content_filter(response: str) -> dict:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
 
+    # Vá lỗ hổng #4a: phần còn lại vẫn chứa secret bị biến đổi (cách ký tự, gạch
+    # nối, đảo ngược, base64, đọc số bằng chữ) hoặc gợi ý từng phần → không che
+    # từng chỗ được, nên thay cả câu trả lời (fail-closed).
+    hidden = _find_obfuscated_secret(redacted) or _find_partial_disclosure(redacted)
+    if hidden:
+        issues.append(hidden)
+        redacted = SAFE_FALLBACK_MESSAGE
+
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+def _load_secret_literals() -> list[str]:
+    values = []
+    try:
+        values = [str(v) for v in (load_protected_payload().get("secrets") or {}).values() if v]
+    except FileNotFoundError:
+        pass
+    # Dài trước ngắn sau để "db.vinbank.internal:5432" được che trọn
+    return sorted(set(values) | set(DEMO_SECRETS), key=len, reverse=True)
+
+
+_SECRET_LITERALS = _load_secret_literals()
+
+_NUMBER_WORDS = {
+    "khong": "0", "mot": "1", "hai": "2", "ba": "3", "bon": "4", "tu": "4",
+    "nam": "5", "sau": "6", "bay": "7", "tam": "8", "chin": "9",
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+
+
+def _compact(text: str) -> str:
+    """Chuẩn hoá mạnh: bỏ dấu, đổi số viết bằng chữ, bỏ mọi ký tự không phải chữ/số."""
+    text = unicodedata.normalize("NFKC", text or "").casefold().replace("đ", "d")
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn"
+    )
+    text = re.sub(
+        r"\b(" + "|".join(_NUMBER_WORDS) + r")\b", lambda m: _NUMBER_WORDS[m.group()], text
+    )
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+_SECRET_COMPACT = sorted(
+    {c for c in (_compact(s) for s in _SECRET_LITERALS) if len(c) >= 6}, key=len, reverse=True
+)
+
+
+def _find_obfuscated_secret(response: str) -> str | None:
+    compact = _compact(response)
+    for needle in _SECRET_COMPACT:
+        if needle in compact:
+            return "obfuscated_secret: spaced/punctuated/spelled"
+        if needle[::-1] in compact:
+            return "obfuscated_secret: reversed"
+    for token in re.findall(r"[A-Za-z0-9+/_-]{8,}={0,2}", response):
+        try:
+            decoded = base64.b64decode(token + "=" * (-len(token) % 4), validate=False)
+            decoded_text = decoded.decode("utf-8", errors="ignore")
+        except (binascii.Error, ValueError):
+            continue
+        if any(needle in _compact(decoded_text) for needle in _SECRET_COMPACT):
+            return "obfuscated_secret: base64"
+    return None
+
+
+_PARTIAL_DISCLOSURE = re.compile(
+    r"(password|pass|mat\s*khau|api\s*key|key|host|token|credential|thong\s*tin\s*dang\s*nhap)"
+    r".{0,60}"
+    r"(bat\s*dau\s*bang|ket\s*thuc\s*bang|starts?\s+with|ends?\s+with|begins?\s+with|"
+    r"first\s+\d+\s+(characters?|letters?)|co\s+\d+\s+ky\s*tu|\d+\s+characters?\s+long|"
+    r"ky\s*tu\s+(dau|cuoi|thu\s+\d+))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _find_partial_disclosure(response: str) -> str | None:
+    text = unicodedata.normalize("NFKC", response or "").replace("đ", "d").replace("Đ", "D")
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn"
+    )
+    if _PARTIAL_DISCLOSURE.search(text):
+        return "partial_disclosure: hint about a credential"
+    return None
 
 
 # ============================================================
@@ -148,12 +240,6 @@ async def llm_safety_check(response_text: str) -> dict:
 #   - llm_response has a .content attribute (types.Content)
 #   - Return the (possibly modified) llm_response, or None to keep original
 # ============================================================
-
-SAFE_FALLBACK_MESSAGE = (
-    "I'm sorry, I can't share that information. "
-    "How else can I help with your VinBank account?"
-)
-
 
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""

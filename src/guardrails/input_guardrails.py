@@ -72,6 +72,37 @@ INJECTION_PATTERNS = [
 ]
 _COMPILED_INJECTION = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
 
+# Vá lỗ hổng #2: không cần biết attacker dùng động từ gì ("điền", "xác nhận",
+# "chuyển sang YAML", "viết truyện"…) — khách hàng không bao giờ cần những tài sản
+# nội bộ này, nên chỉ cần NHẮC tới là chặn. "Đổi mật khẩu của tôi" vẫn được phép
+# vì chỉ chặn mật khẩu của admin/hệ thống.
+INTERNAL_ASSET_PATTERNS = [
+    r"\bapi[\s_-]*keys?\b",
+    r"\b(admin|root|system|he\s+thong|quan\s+tri)\w*\s+(password|pass|pwd|mat\s+khau|credentials?)",
+    r"\b(password|mat\s+khau|credentials?|thong\s+tin\s+dang\s+nhap)\s+(cua\s+)?(admin|root|he\s+thong|quan\s+tri|bao\s+tri)",
+    r"\b(database|db)\s*(host|hostname|server|port|connection)",
+    r"\b(host|hostname|port)\s+(va\s+port\s+)?(cua\s+)?(database|db|co\s+so\s+du\s+lieu)",
+    r"\bconnection\s+string\b",
+    r"\binternal\s+(notes?|config(uration)?|credentials?|systems?)\b",
+    r"\bghi\s+chu\s+noi\s+bo\b",
+    r"\b(thong\s+tin|cau\s+hinh|he\s+thong)\s+noi\s+bo\b",
+    r"\bthong\s+tin\s+(thiet\s+lap|cau\s+hinh)\b",
+    r"\b(setup|system)\s+(context|config(uration)?|notes?)\b",
+    r"\bsecrets?\b",
+    r"\.internal\b",
+    r"\bsk-[a-z0-9]",
+]
+_COMPILED_ASSETS = [re.compile(p, re.IGNORECASE) for p in INTERNAL_ASSET_PATTERNS]
+
+# Vá lỗ hổng #3: ký tự Cyrillic/Greek trông giống chữ Latin (homoglyph)
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+    "і": "i", "ј": "j", "ѕ": "s", "к": "k", "м": "m", "т": "t", "н": "h",
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O",
+    "Р": "P", "С": "C", "Т": "T", "Х": "X", "І": "I",
+    "α": "a", "ο": "o", "ρ": "p", "ε": "e", "ι": "i", "κ": "k", "ν": "v",
+})
+
 
 def normalize_text(text: str) -> str:
     """Chuẩn hoá trước khi so pattern.
@@ -83,12 +114,22 @@ def normalize_text(text: str) -> str:
     """
     text = unicodedata.normalize("NFKC", text or "")
     text = text.translate(str.maketrans("", "", _INVISIBLE_CHARS))
+    text = text.translate(_CONFUSABLES)
     text = text.replace("đ", "d").replace("Đ", "D")
     text = "".join(
         ch for ch in unicodedata.normalize("NFD", text)
         if unicodedata.category(ch) != "Mn"
     )
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _collapse_spaced_letters(text: str) -> str:
+    """Nối chữ bị tách từng ký tự: ``p a s s w o r d`` → ``password``."""
+    return re.sub(
+        r"\b(?:\w[\s.\-_*]){3,}\w\b",
+        lambda m: re.sub(r"[\s.\-_*]", "", m.group()),
+        text,
+    )
 
 
 def detect_injection(user_input: str) -> InputStatus:
@@ -101,9 +142,11 @@ def detect_injection(user_input: str) -> InputStatus:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
     normalized = normalize_text(user_input)
-    for pattern in _COMPILED_INJECTION:
-        if pattern.search(normalized):
-            return "BLOCK"
+    # Kiểm tra cả bản gốc lẫn bản đã nối chữ bị tách
+    for candidate in {normalized, _collapse_spaced_letters(normalized)}:
+        for pattern in _COMPILED_INJECTION + _COMPILED_ASSETS:
+            if pattern.search(candidate):
+                return "BLOCK"
     return "ALLOW"
 
 
@@ -141,9 +184,10 @@ def topic_filter(user_input: str) -> InputStatus:
         if re.search(rf"\b{re.escape(topic)}", input_lower):
             return "BLOCK"
 
-    # 2. Phải có ít nhất một tín hiệu banking
+    # 2. Phải có ít nhất một tín hiệu banking — so theo ranh giới từ
+    #    (vá lỗ hổng #1: trước đây "bank" khớp cả trong "VinBank")
     for topic in ALLOWED_TOPICS + EXTRA_BANKING_KEYWORDS:
-        if topic in input_lower:
+        if re.search(rf"\b{re.escape(topic)}", input_lower):
             return "ALLOW"
 
     # 3. Không liên quan banking → chặn

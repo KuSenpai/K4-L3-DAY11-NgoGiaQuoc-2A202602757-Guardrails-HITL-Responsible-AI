@@ -186,7 +186,14 @@ async def _run_request(
             try:
                 response = await runner.chat(agent, text)
             except Exception as e:  # network / quota — record, do not crash suite
-                response = f"[LLM error: {type(e).__name__}: {e}]"
+                layer = "llm_error"
+                if type(e).__name__ in {"RateLimitError", "APITimeoutError", "APIConnectionError"}:
+                    response = (
+                        "The assistant is busy right now (model provider limit). "
+                        "Please try again in a moment."
+                    )
+                else:
+                    response = f"[LLM error: {type(e).__name__}: {e}]"
         else:
             response = "(passed rate limiter + input guardrail; LLM call skipped in spam test)"
 

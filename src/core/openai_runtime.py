@@ -8,6 +8,7 @@ Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -62,7 +63,9 @@ class OpenAIRunner:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
+        # SDK đồng bộ → chạy trong thread để không chặn event loop (server UI)
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
             model=self.model,
             messages=[
                 {"role": "system", "content": agent.instruction},

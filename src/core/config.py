@@ -120,6 +120,10 @@ def blue_client_kwargs() -> dict:
             os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL).strip()
             or OPENROUTER_BASE_URL
         ),
+        # Model :free hay bị 429; SDK mặc định tự chờ Retry-After (~60s) rồi thử lại
+        # → người dùng đợi rất lâu mà không biết. Báo lỗi nhanh thay vì chờ ngầm.
+        "timeout": 30.0,
+        "max_retries": 0,
     }
 
 

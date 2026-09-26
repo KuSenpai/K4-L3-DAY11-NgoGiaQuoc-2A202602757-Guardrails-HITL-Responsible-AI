@@ -22,7 +22,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -44,7 +44,6 @@ app = FastAPI(title="VinBank Guardrails Chat")
 class ChatRequest(BaseModel):
     message: str = Field(default="", max_length=20000)
     target: str = "blue"
-    user_id: str = Field(default="web-user", max_length=64)
 
 
 class _State:
@@ -109,18 +108,21 @@ def info():
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
     if req.target not in TARGETS:
         raise HTTPException(400, f"target must be one of {TARGETS}")
 
     started = time.perf_counter()
 
     if req.target == "blue":
+        # Danh tính cho rate limiter do SERVER xác định (IP), không tin user_id
+        # client gửi lên — nếu không, đổi user_id mỗi request là vượt rate limit.
+        client_ip = request.client.host if request.client else "unknown"
         pipeline = dict(state.pipeline, llm=state.blue_llm())
         result = await _run_request(
             pipeline,
             req.message,
-            user_id=req.user_id or "web-user",
+            user_id=f"ip:{client_ip}",
             request_id=state.next_request_id(),
             preview_chars=None,
         )

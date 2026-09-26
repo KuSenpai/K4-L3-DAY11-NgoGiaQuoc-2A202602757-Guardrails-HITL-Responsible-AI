@@ -182,11 +182,10 @@
     <div class="card">
       <h3>Phiên</h3>
       <div class="row">
-        <label for="userId">user_id</label>
-        <input id="userId" value="web-user" maxlength="64">
         <button class="ghost" id="spam" type="button" title="Gửi 12 request liên tiếp để thử rate limiter">Spam ×12</button>
         <button class="ghost" id="reset" type="button">Reset</button>
       </div>
+      <p class="muted" style="margin:8px 0 0">Rate limit tính theo IP (server xác định). Sau khi spam, phiên chat Blue bị khoá tới 60s — bấm Reset để mở lại.</p>
     </div>
 
     <div class="card">
@@ -279,6 +278,7 @@ function badges(r) {
   if (r.blocked) out.push(`<span class="badge b-warn">Chặn · ${esc(LAYER_LABEL[r.layer] || r.layer || "?")}</span>`);
   else if (r.redacted) out.push(`<span class="badge b-info">Đã che · ${esc(LAYER_LABEL[r.layer] || r.layer)}</span>`);
   else if (r.layer === "model_refuse") out.push(`<span class="badge b-info">Model từ chối</span>`);
+  else if (r.layer === "llm_error") out.push(`<span class="badge b-bad">LLM bận / lỗi</span>`);
   else if (!r.leaked) out.push(`<span class="badge b-ok">Qua</span>`);
   return out.join("");
 }
@@ -335,13 +335,13 @@ async function refreshMetrics() {
   } catch { /* backend chưa sẵn sàng */ }
 }
 
-async function send(text, { quiet = false, userId = null } = {}) {
+async function send(text, { quiet = false } = {}) {
   if (!quiet) addUser(text);
   const pending = quiet ? null : addPending();
   try {
     const res = await fetch("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, target, user_id: userId || $("userId").value.trim() || "web-user" }),
+      body: JSON.stringify({ message: text, target }),
     });
     const r = await res.json();
     if (!res.ok) throw new Error(r.detail || res.statusText);
@@ -399,10 +399,8 @@ $("spam").addEventListener("click", async () => {
   busy = true; sendBtn.disabled = true;
   addUser("[Spam ×12] What is my account balance?");
   const pending = addPending();
-  // user_id riêng để không khoá luôn phiên chat chính 60s
-  const spamUser = "spammer-" + Date.now().toString(36);
   const results = await Promise.all(
-    Array.from({ length: 12 }, () => send("What is my account balance?", { quiet: true, userId: spamUser })));
+    Array.from({ length: 12 }, () => send("What is my account balance?", { quiet: true })));
   const blocked = results.filter(r => r && r.blocked && r.layer === "rate_limiter").length;
   fillBot(pending, {
     response: `Đã gửi 12 request: **${12 - blocked}** qua, **${blocked}** bị rate limiter chặn.`,
